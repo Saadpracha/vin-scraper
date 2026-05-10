@@ -1,0 +1,723 @@
+import asyncio
+import csv
+from pathlib import Path
+
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeout
+)
+
+# =========================
+# CONFIG
+# =========================
+
+TIMEOUT_MS = 10000
+
+# After each full batch, timed-out VINs run again in a fresh browser session.
+MAX_TIMEOUT_RETRY_SESSIONS = 2
+
+INPUT_FILE = "ford_recalls_input.xlsx"
+
+URL = "https://www.ford.ca/support/recalls/"
+
+OUTPUT_FILE = "ford_recalls_output4.csv"
+
+# Ford CA — contains(., ...) catches trailing * and mixed text nodes
+XPATH_H2_NO_RECALLS = '//h2[contains(., "No Recalls")]'
+XPATH_H2_NO_CSP = (
+    '//h2[contains(., "No Customer Satisfaction Programs")]'
+)
+XPATH_H2_RECALLS_OR_CSP = (
+    '//h2[contains(., "Recalls")] | '
+    '//h2[contains(., "Customer Satisfaction Programs")]'
+)
+
+XPATH_VEHICLE_YM = '//div[@class="vehicle-information-ym"]'
+
+
+# =========================
+# HELPERS
+# =========================
+
+def _normalize_header(header):
+    return (str(header or "")).strip().upper()
+
+
+async def safe_text(locator):
+    try:
+        if await locator.count() > 0:
+            return (await locator.first.inner_text()).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def read_vins_from_file():
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        raise ValueError(f"Input file not found: {INPUT_FILE}")
+
+    suffix = input_path.suffix.lower()
+
+    if suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:
+            raise ValueError(
+                "Install openpyxl: pip install openpyxl"
+            ) from exc
+
+        workbook = load_workbook(
+            filename=INPUT_FILE,
+            read_only=True,
+            data_only=True,
+        )
+        sheet = workbook.active
+        header_row = next(
+            sheet.iter_rows(min_row=1, max_row=1, values_only=True),
+            None,
+        )
+        if not header_row:
+            raise ValueError(f"No header row in {INPUT_FILE}")
+
+        vin_col_index = None
+        for index, header in enumerate(header_row):
+            if _normalize_header(header) == "VIN":
+                vin_col_index = index
+                break
+        if vin_col_index is None:
+            raise ValueError(f"Column 'VIN' not found in {INPUT_FILE}")
+
+        vins = []
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if vin_col_index >= len(row):
+                continue
+            vin = str(row[vin_col_index] or "").strip()
+            if vin:
+                vins.append(vin)
+        workbook.close()
+        if not vins:
+            raise ValueError(
+                f"No VIN values in column 'VIN' in {INPUT_FILE}"
+            )
+        print(f"Loaded {len(vins)} VIN(s) from xlsx: {INPUT_FILE}")
+        return vins
+
+    if suffix == ".csv":
+        encodings_to_try = [
+            "utf-8-sig", "utf-8", "cp1252", "latin-1"
+        ]
+        last_decode_error = None
+        for encoding in encodings_to_try:
+            try:
+                with open(
+                    INPUT_FILE, "r", newline="", encoding=encoding
+                ) as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    if not reader.fieldnames:
+                        raise ValueError(
+                            f"No header row in {INPUT_FILE}"
+                        )
+                    normalized = {
+                        _normalize_header(h): h
+                        for h in reader.fieldnames
+                    }
+                    vin_key = normalized.get("VIN")
+                    if not vin_key:
+                        raise ValueError(
+                            f"Column 'VIN' not found in {INPUT_FILE}"
+                        )
+                    vins = [
+                        (row.get(vin_key) or "").strip()
+                        for row in reader
+                    ]
+                    vins = [v for v in vins if v]
+                    if not vins:
+                        raise ValueError(
+                            f"No VIN values in column 'VIN' in {INPUT_FILE}"
+                        )
+                    print(
+                        f"Loaded {len(vins)} VIN(s) from csv ({encoding})"
+                    )
+                    return vins
+            except UnicodeDecodeError as decode_error:
+                last_decode_error = decode_error
+                continue
+        if last_decode_error:
+            raise ValueError(
+                f"Could not decode {INPUT_FILE}."
+            ) from last_decode_error
+        raise ValueError(f"Could not read {INPUT_FILE}")
+
+    raise ValueError(
+        f"Unsupported extension '{suffix}'. Use .xlsx or .csv"
+    )
+
+
+async def purge_cookies_and_cache(context, page):
+    """
+    Clear cookies and disk cache before closing the browser instance.
+    """
+    try:
+        await context.clear_cookies()
+    except Exception:
+        pass
+    try:
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("Network.clearBrowserCache")
+    except Exception:
+        pass
+
+
+def split_year_and_model(vehicle_line):
+    """First whitespace-separated token = year; remainder = model."""
+    line = (vehicle_line or "").strip()
+    if not line:
+        return "", ""
+    parts = line.split(None, 1)
+    year = parts[0]
+    model = parts[1] if len(parts) > 1 else ""
+    return year, model
+
+
+async def expand_all_collapsed_accordions(page):
+    """
+    When recall or CSP has data, expand every collapsed row first.
+    Pattern: accordion-item/button[@aria-expanded="false"] under #recalls-content.
+    """
+    root = page.locator("#recalls-content")
+    if await root.count() == 0:
+        root = page
+
+    collapsed_xpath = (
+        './/div[contains(@class,"accordion-item")]'
+        '/button[@aria-expanded="false"]'
+    )
+
+    for _ in range(50):
+        collapsed = root.locator(f"xpath={collapsed_xpath}")
+        if await collapsed.count() == 0:
+            break
+        btn = collapsed.first
+        try:
+            await btn.scroll_into_view_if_needed()
+            await btn.click(timeout=TIMEOUT_MS)
+        except Exception:
+            break
+
+
+async def wait_for_results_panel_ready(page):
+    """Any recalls/CSP shell or heading suffices; attached (not visible)."""
+    try:
+        await page.locator("#recalls-content").wait_for(
+            state="attached",
+            timeout=TIMEOUT_MS,
+        )
+    except PlaywrightTimeout:
+        pass
+
+    ready_marker = (
+        page.locator("#recalls-section")
+        .or_(page.locator("#csp-section"))
+        .or_(page.locator("#recalls-content"))
+        .or_(
+            page.locator("#recalls-content div.recalls-section").first
+        )
+        .or_(page.locator("#recalls-content div.csp-section").first)
+        .or_(page.locator(f"xpath={XPATH_H2_RECALLS_OR_CSP}"))
+        .or_(page.locator(f"xpath={XPATH_H2_NO_RECALLS}"))
+        .or_(page.locator(f"xpath={XPATH_H2_NO_CSP}"))
+    )
+    await ready_marker.first.wait_for(
+        state="attached",
+        timeout=TIMEOUT_MS,
+    )
+
+
+async def locate_recalls_root(page):
+    loc = page.locator("#recalls-section")
+    if await loc.count() > 0:
+        return loc
+    accordions = page.locator(
+        '#recalls-content [data-testid="recalls-csp-accordions"]'
+    )
+    nested = accordions.locator("div.recalls-section")
+    if await nested.count() > 0:
+        return nested.first
+    loose = page.locator("#recalls-content div.recalls-section")
+    if await loose.count() > 0:
+        return loose.first
+    return loc
+
+
+async def locate_csp_root(page):
+    loc = page.locator("#csp-section")
+    if await loc.count() > 0:
+        return loc
+    accordions = page.locator(
+        '#recalls-content [data-testid="recalls-csp-accordions"]'
+    )
+    nested = accordions.locator("div.csp-section")
+    if await nested.count() > 0:
+        return nested.first
+    loose = page.locator("#recalls-content div.csp-section")
+    if await loose.count() > 0:
+        return loose.first
+    return loc
+
+
+async def load_recall_and_csp_data(page):
+    await wait_for_results_panel_ready(page)
+
+    recalls_shell = await locate_recalls_root(page)
+    csp_shell = await locate_csp_root(page)
+
+    has_recalls_shell = (await recalls_shell.count()) > 0
+    has_csp_shell = (await csp_shell.count()) > 0
+
+    no_recalls_heading = (
+        await page.locator(f"xpath={XPATH_H2_NO_RECALLS}").count()
+    ) > 0
+    no_csp_heading = (
+        await page.locator(f"xpath={XPATH_H2_NO_CSP}").count()
+    ) > 0
+
+    no_recalls_class = False
+    if has_recalls_shell:
+        root_cls = (
+            await recalls_shell.first.get_attribute("class") or ""
+        )
+        no_recalls_class = (
+            "no-recalls" in root_cls
+            or (await recalls_shell.locator(".no-recalls").count()) > 0
+        )
+
+    no_csp_class = False
+    if has_csp_shell:
+        root_cls = await csp_shell.first.get_attribute("class") or ""
+        no_csp_class = (
+            "no-csp" in root_cls
+            or (await csp_shell.locator(".no-csp").count()) > 0
+        )
+
+    no_recalls_state = no_recalls_heading or no_recalls_class
+    no_csp_state = no_csp_heading or no_csp_class
+
+    recall_or_csp_has_data = (
+        (has_recalls_shell and not no_recalls_state)
+        or (
+            has_csp_shell and not no_csp_state
+        )
+    )
+    if recall_or_csp_has_data:
+        await expand_all_collapsed_accordions(page)
+
+    if has_recalls_shell and not no_recalls_state:
+        recalls = await parse_recalls(page)
+    else:
+        recalls = []
+
+    if has_csp_shell and not no_csp_state:
+        customer_satisfaction_programs = await parse_csp(page)
+    else:
+        customer_satisfaction_programs = []
+
+    return recalls, customer_satisfaction_programs
+
+
+# =========================
+# PARSE RECALLS
+# =========================
+
+async def parse_recalls(page):
+    """
+    XPath semantics (Ford CA):
+      title: #recalls-section//div[@class="accordion-titles"]/div
+      status: #recalls-section//div[@class="accordion-titles"]/span
+      campaign: div[@data-testid="accordion-description"] @id
+    Description duplicates title.
+    """
+    recalls = []
+
+    recalls_section = page.locator('#recalls-section')
+    if await recalls_section.count() == 0:
+        recalls_section = await locate_recalls_root(page)
+
+    if await recalls_section.count() == 0:
+        return recalls
+
+    items = recalls_section.locator(
+        'xpath=.//div[contains(@class,"accordion-item")]'
+    )
+    n = await items.count()
+
+    for i in range(n):
+        item = items.nth(i)
+
+        title = await safe_text(
+            item.locator(
+                'xpath=.//div[@class="accordion-titles"]/div'
+            )
+        )
+        title = " ".join(title.split()) if title else ""
+
+        if not title:
+            continue
+
+        status = await safe_text(
+            item.locator(
+                'xpath=.//div[@class="accordion-titles"]/span'
+            )
+        )
+        status = " ".join(status.split()) if status else ""
+
+        campaign_el = item.locator(
+            'xpath=.//div[@data-testid="accordion-description"]'
+        )
+        campaign = ""
+        if await campaign_el.count() > 0:
+            campaign = (
+                await campaign_el.first.get_attribute("id") or ""
+            ).strip()
+
+        recalls.append({
+            "title": title,
+            "description": title,
+            "campaign": campaign,
+            "status": status
+        })
+
+    return recalls
+
+
+# =========================
+# PARSE CSP
+# =========================
+
+async def parse_csp(page):
+    """
+    XPath semantics:
+      title: #csp-section//div[@class="accordion-titles"]/div
+      campaign: div[data-testid=accordion-description] @id (per row)
+      next step: div[contains(., Next Steps)]/following-sibling::div (per row)
+    Description duplicates title (no CSP status).
+    """
+    csp_results = []
+
+    csp_section = page.locator('#csp-section')
+    if await csp_section.count() == 0:
+        csp_section = await locate_csp_root(page)
+
+    if await csp_section.count() == 0:
+        return csp_results
+
+    items = csp_section.locator(
+        'xpath=.//div[contains(@class,"accordion-item")]'
+    )
+    n = await items.count()
+
+    for i in range(n):
+        item = items.nth(i)
+
+        title = await safe_text(
+            item.locator(
+                'xpath=.//div[@class="accordion-titles"]/div'
+            )
+        )
+        title = " ".join(title.split()) if title else ""
+
+        if not title:
+            continue
+
+        campaign_el = item.locator(
+            'xpath=.//div[@data-testid="accordion-description"]'
+        )
+        campaign = ""
+        if await campaign_el.count() > 0:
+            campaign = (
+                await campaign_el.first.get_attribute("id") or ""
+            ).strip()
+
+        next_steps = await safe_text(
+            item.locator(
+                'xpath=.//div[contains(.,"Next Steps")]'
+                '/following-sibling::div'
+            )
+        )
+        next_steps = " ".join(next_steps.split()) if next_steps else ""
+
+        csp_results.append({
+            "title": title,
+            "description": title,
+            "campaign": campaign,
+            "next_steps": next_steps
+        })
+
+    return csp_results
+
+
+# =========================
+# SAVE CSV
+# =========================
+
+def save_to_csv(data):
+    file_exists = Path(OUTPUT_FILE).exists()
+    rows = []
+
+    if data["recalls"]:
+        for recall in data["recalls"]:
+            rows.append({
+                "VIN": data["vin"],
+                "Section": "Recall",
+                "Year": data["year"],
+                "Model": data["model"],
+                "Title": recall["title"],
+                "Description": recall["description"],
+                "Campaign": recall["campaign"],
+                "Status": recall["status"],
+                "Next Steps": ""
+            })
+    else:
+        rows.append({
+            "VIN": data["vin"],
+            "Section": "Recall",
+            "Year": data["year"],
+            "Model": data["model"],
+            "Title": "",
+            "Description": "",
+            "Campaign": "",
+            "Status": "No Recalls",
+            "Next Steps": ""
+        })
+
+    if data["customer_satisfaction_programs"]:
+        for csp in data["customer_satisfaction_programs"]:
+            rows.append({
+                "VIN": data["vin"],
+                "Section": "Customer Satisfaction Program",
+                "Year": data["year"],
+                "Model": data["model"],
+                "Title": csp["title"],
+                "Description": csp["description"],
+                "Campaign": csp["campaign"],
+                "Status": "",
+                "Next Steps": csp["next_steps"]
+            })
+    else:
+        rows.append({
+            "VIN": data["vin"],
+            "Section": "Customer Satisfaction Program",
+            "Year": data["year"],
+            "Model": data["model"],
+            "Title": "",
+            "Description": "",
+            "Campaign": "",
+            "Status": "",
+            "Next Steps": "No CSP"
+        })
+
+    fieldnames = [
+        "VIN",
+        "Section",
+        "Year",
+        "Model",
+        "Title",
+        "Description",
+        "Campaign",
+        "Status",
+        "Next Steps",
+    ]
+
+    with open(
+        OUTPUT_FILE,
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nSaved data to: {OUTPUT_FILE}")
+
+
+# =========================
+# MAIN
+# =========================
+
+async def process_one_vin_fresh_browser(playwright, vin):
+    """
+    Dedicated browser lifecycle per VIN: launch → extract → purge
+    cookies/cache → close (then next VIN starts a brand-new browser).
+
+    Returns `vin` if Playwright timed out (caller may retry in a new round).
+    """
+    browser = await playwright.chromium.launch(
+        headless=False,
+        slow_mo=50,
+    )
+
+    context = await browser.new_context()
+    page = await context.new_page()
+
+    timed_out = None
+
+    try:
+        print(f"\nOpening: {URL}")
+
+        await page.goto(URL, wait_until="domcontentloaded")
+
+        vin_input = page.locator(
+            '//input[@aria-label="Input VIN."]'
+        )
+        await vin_input.wait_for(
+            state="visible",
+            timeout=TIMEOUT_MS,
+        )
+
+        print(f"VIN lookup: {vin}")
+
+        await vin_input.click()
+        await vin_input.fill(vin)
+        await vin_input.press("Enter")
+
+        try:
+            await page.wait_for_load_state(
+                "networkidle",
+                timeout=TIMEOUT_MS,
+            )
+        except PlaywrightTimeout:
+            pass
+
+        vehicle_info = page.locator(
+            f"xpath={XPATH_VEHICLE_YM}"
+        )
+        await vehicle_info.wait_for(
+            state="visible",
+            timeout=TIMEOUT_MS,
+        )
+
+        vehicle_text = (
+            await vehicle_info.first.inner_text()
+        ).strip()
+        year_part, model_part = split_year_and_model(
+            vehicle_text
+        )
+
+        final_data = {
+            "year": year_part,
+            "model": model_part,
+            "vin": vin,
+            "recalls": [],
+            "customer_satisfaction_programs": [],
+        }
+
+        (
+            final_data["recalls"],
+            final_data[
+                "customer_satisfaction_programs"
+            ],
+        ) = await load_recall_and_csp_data(page)
+
+        print("\n========== FINAL OUTPUT ==========\n")
+        print(final_data)
+
+        save_to_csv(final_data)
+
+    except PlaywrightTimeout:
+        print(
+            f"\nTimeout for VIN {vin} — not saved; "
+            "will retry in another fresh browser round."
+        )
+        timed_out = vin
+
+    except Exception as vin_error:
+        print(
+            f"\nFailed for VIN {vin} (not a timeout): "
+            f"{vin_error}"
+        )
+
+    finally:
+        try:
+            await purge_cookies_and_cache(context, page)
+        except Exception:
+            pass
+
+        await page.close()
+        await context.close()
+        await browser.close()
+
+        print(
+            f"Closed browser for VIN {vin} "
+            "(cookies/cache cleared)."
+        )
+
+    return timed_out
+
+
+async def main():
+    try:
+        all_vins = read_vins_from_file()
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        return
+
+    pending = list(all_vins)
+    round_num = 0
+
+    async with async_playwright() as p:
+        while pending:
+            round_num += 1
+            print(
+                f"\n{'=' * 60}\n"
+                f"Round {round_num} — {len(pending)} VIN(s) "
+                f"(new browser instance per VIN)\n"
+                f"{'=' * 60}"
+            )
+
+            timeout_vins = []
+            vin_index = 0
+            round_list = list(pending)
+
+            for vin in round_list:
+                vin_index += 1
+                print(
+                    f"\n--- Fresh browser ({vin_index}/"
+                    f"{len(round_list)}) ---"
+                )
+
+                retry_vin = await process_one_vin_fresh_browser(
+                    p,
+                    vin,
+                )
+                if retry_vin:
+                    timeout_vins.append(retry_vin)
+
+            pending = timeout_vins
+
+            if pending:
+                print(
+                    f"\nTimed out this round ({len(pending)}): "
+                    f"{pending}"
+                )
+
+            if round_num >= MAX_TIMEOUT_RETRY_SESSIONS and pending:
+                print(
+                    f"\nStopped after {MAX_TIMEOUT_RETRY_SESSIONS} "
+                    f"rounds. Not saved (still timing out): {pending}"
+                )
+                break
+
+    if not pending:
+        print(
+            "\nAll VINs processed and saved to CSV."
+        )
+    else:
+        print(
+            f"\nUnfinished VINs (not written to CSV): {pending}"
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
