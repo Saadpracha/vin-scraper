@@ -19,11 +19,18 @@ TIMEOUT_MS = 10000
 # After each full batch, timed-out VINs run again in a fresh browser session.
 MAX_TIMEOUT_RETRY_SESSIONS = 2
 
-INPUT_FILE = "ford_recalls_input.xlsx"
+INPUT_FILE = "FORD-VIN-2020-2026.csv"
 
 URL = "https://fr.ford.ca/support/recalls/"
 
 OUTPUT_FILE = "fr_ford_recalls_output.csv"
+
+# Runtime throttling + crash-resume
+BATCH_SIZE = 50
+PER_VIN_DELAY_SECONDS_RANGE = (2, 5)
+BATCH_SLEEP_SECONDS_RANGE = (12 * 60, 15 * 60)
+CHECKPOINT_FILE = "checkpoint_last_vin.txt"
+FAILED_VINS_FILE = "failed_vins.csv"
 
 # One random row per VIN; HTTP proxy (CONNECT) for Chromium.
 # CSV columns: Host, Port, User, Pass (case-insensitive headers).
@@ -159,6 +166,116 @@ def read_vins_from_file():
     raise ValueError(
         f"Unsupported extension '{suffix}'. Use .xlsx or .csv"
     )
+
+
+def load_checkpoint_last_vin():
+    """
+    Returns the last successfully-scraped VIN (string) or "" if none.
+    Kept as a single-line text file to avoid JSON corruption issues on crash.
+    """
+    path = Path(CHECKPOINT_FILE)
+    if not path.exists():
+        return ""
+    try:
+        return (path.read_text(encoding="utf-8") or "").strip()
+    except Exception:
+        return ""
+
+
+def save_checkpoint_last_vin(vin):
+    try:
+        Path(CHECKPOINT_FILE).write_text(
+            (vin or "").strip(),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def log_failed_vin(vin, reason):
+    """
+    Append failures to a small CSV so you can re-run only failed VINs later.
+    """
+    file_exists = Path(FAILED_VINS_FILE).exists()
+    try:
+        with open(
+            FAILED_VINS_FILE,
+            "a",
+            newline="",
+            encoding="utf-8-sig",
+        ) as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["VIN", "Reason"]
+            )
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(
+                {"VIN": (vin or "").strip(), "Reason": str(reason)}
+            )
+    except Exception:
+        pass
+
+
+def iter_vins_from_csv_streaming(resume_after_vin=""):
+    """
+    Stream VINs from INPUT_FILE without loading them all into RAM.
+
+    If resume_after_vin is provided, skip rows until that VIN is seen once,
+    then yield subsequent VINs.
+    """
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        raise ValueError(f"Input file not found: {INPUT_FILE}")
+    if input_path.suffix.lower() != ".csv":
+        # For xlsx we keep the old behavior (small lists only).
+        for vin in read_vins_from_file():
+            yield vin
+        return
+
+    encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+    last_decode_error = None
+    for encoding in encodings_to_try:
+        try:
+            with open(
+                INPUT_FILE,
+                "r",
+                newline="",
+                encoding=encoding,
+            ) as csvfile:
+                reader = csv.DictReader(csvfile)
+                if not reader.fieldnames:
+                    raise ValueError(f"No header row in {INPUT_FILE}")
+
+                normalized = {
+                    _normalize_header(h): h for h in reader.fieldnames
+                }
+                vin_key = normalized.get("VIN")
+                if not vin_key:
+                    raise ValueError(
+                        f"Column 'VIN' not found in {INPUT_FILE}"
+                    )
+
+                skipping = bool(resume_after_vin)
+                resume_after_vin = (resume_after_vin or "").strip()
+
+                for row in reader:
+                    vin = (row.get(vin_key) or "").strip()
+                    if not vin:
+                        continue
+                    if skipping:
+                        if vin == resume_after_vin:
+                            skipping = False
+                        continue
+                    yield vin
+            return
+        except UnicodeDecodeError as decode_error:
+            last_decode_error = decode_error
+            continue
+    if last_decode_error:
+        raise ValueError(
+            f"Could not decode {INPUT_FILE}."
+        ) from last_decode_error
+    raise ValueError(f"Could not read {INPUT_FILE}")
 
 
 def _row_to_playwright_proxy(row):
@@ -671,7 +788,10 @@ async def process_one_vin_fresh_browser(playwright, vin, proxy=None):
 
     `proxy`: optional Playwright proxy dict (e.g. random pick per VIN).
 
-    Returns `vin` if Playwright timed out (caller may retry in a new round).
+    Returns:
+      - "ok" on success (saved to CSV + checkpoint updated)
+      - "timeout" on PlaywrightTimeout (not saved)
+      - "error" on other exceptions (not saved)
     """
     browser = await playwright.chromium.launch(
         headless=False,
@@ -689,7 +809,7 @@ async def process_one_vin_fresh_browser(playwright, vin, proxy=None):
     context = await browser.new_context(**context_options)
     page = await context.new_page()
 
-    timed_out = None
+    status = "error"
 
     try:
         print(f"\nOpening: {URL}")
@@ -748,23 +868,23 @@ async def process_one_vin_fresh_browser(playwright, vin, proxy=None):
             ],
         ) = await load_recall_and_csp_data(page)
 
-        print("\n========== FINAL OUTPUT ==========\n")
-        print(final_data)
-
         save_to_csv(final_data)
+        save_checkpoint_last_vin(vin)
+        status = "ok"
 
     except PlaywrightTimeout:
         print(
             f"\nTimeout for VIN {vin} — not saved; "
-            "will retry in another fresh browser round."
+            "will retry."
         )
-        timed_out = vin
+        status = "timeout"
 
     except Exception as vin_error:
         print(
             f"\nFailed for VIN {vin} (not a timeout): "
             f"{vin_error}"
         )
+        status = "error"
 
     finally:
         try:
@@ -781,79 +901,76 @@ async def process_one_vin_fresh_browser(playwright, vin, proxy=None):
             "(cookies/cache cleared)."
         )
 
-    return timed_out
+    return status
 
 
 async def main():
-    try:
-        all_vins = read_vins_from_file()
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        return
-
     proxies = load_proxies_from_file()
+    last_vin = load_checkpoint_last_vin()
+    if last_vin:
+        print(
+            f"\nResuming after last saved VIN: {last_vin}\n"
+            f"(If that VIN is not found in the input file, scraping will "
+            f"start from the beginning.)"
+        )
 
-    pending = list(all_vins)
-    round_num = 0
+    vins_iter = iter_vins_from_csv_streaming(
+        resume_after_vin=last_vin
+    )
 
     async with async_playwright() as p:
-        while pending:
-            round_num += 1
-            print(
-                f"\n{'=' * 60}\n"
-                f"Round {round_num} — {len(pending)} VIN(s) "
-                f"(new browser instance per VIN)\n"
-                f"{'=' * 60}"
+        processed_in_batch = 0
+        total_processed = 0
+
+        for vin in vins_iter:
+            vin = (vin or "").strip()
+            if not vin:
+                continue
+
+            total_processed += 1
+            processed_in_batch += 1
+
+            # Small delay between VINs
+            await asyncio.sleep(
+                random.uniform(*PER_VIN_DELAY_SECONDS_RANGE)
             )
 
-            timeout_vins = []
-            vin_index = 0
-            round_list = list(pending)
+            proxy = random.choice(proxies) if proxies else None
 
-            for vin in round_list:
-                vin_index += 1
+            # Retry loop per VIN (fresh browser each attempt)
+            last_error = ""
+            status = "error"
+            for attempt in range(1, MAX_TIMEOUT_RETRY_SESSIONS + 2):
                 print(
-                    f"\n--- Fresh browser ({vin_index}/"
-                    f"{len(round_list)}) ---"
+                    f"\nVIN {vin} — attempt {attempt}/"
+                    f"{MAX_TIMEOUT_RETRY_SESSIONS + 1}"
                 )
-
-                proxy = (
-                    random.choice(proxies)
-                    if proxies
-                    else None
+                status = await process_one_vin_fresh_browser(
+                    p, vin, proxy
                 )
+                if status == "ok":
+                    break
+                if status == "timeout":
+                    last_error = "timeout"
+                    await asyncio.sleep(random.uniform(5, 10))
+                    continue
+                last_error = "error"
+                await asyncio.sleep(random.uniform(10, 20))
 
-                retry_vin = await process_one_vin_fresh_browser(
-                    p,
-                    vin,
-                    proxy,
-                )
-                if retry_vin:
-                    timeout_vins.append(retry_vin)
+            if status != "ok":
+                log_failed_vin(vin, last_error or status)
 
-            pending = timeout_vins
-
-            if pending:
+            # Batch sleep after every BATCH_SIZE VINs attempted
+            if processed_in_batch >= BATCH_SIZE:
+                processed_in_batch = 0
+                sleep_s = random.uniform(*BATCH_SLEEP_SECONDS_RANGE)
                 print(
-                    f"\nTimed out this round ({len(pending)}): "
-                    f"{pending}"
+                    f"\nBatch complete ({BATCH_SIZE} VINs). Sleeping "
+                    f"{int(sleep_s)} seconds before continuing..."
                 )
+                await asyncio.sleep(sleep_s)
 
-            if round_num >= MAX_TIMEOUT_RETRY_SESSIONS and pending:
-                print(
-                    f"\nStopped after {MAX_TIMEOUT_RETRY_SESSIONS} "
-                    f"rounds. Not saved (still timing out): {pending}"
-                )
-                break
-
-    if not pending:
-        print(
-            "\nAll VINs processed and saved to CSV."
-        )
-    else:
-        print(
-            f"\nUnfinished VINs (not written to CSV): {pending}"
-        )
+    print("\nDone.")
 
 
 if __name__ == "__main__":
