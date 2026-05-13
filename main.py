@@ -1,5 +1,8 @@
 import asyncio
 import csv
+import os
+import random
+import sys
 from pathlib import Path
 
 from playwright.async_api import (
@@ -18,9 +21,13 @@ MAX_TIMEOUT_RETRY_SESSIONS = 2
 
 INPUT_FILE = "ford_recalls_input.xlsx"
 
-URL = "https://www.ford.ca/support/recalls/"
+URL = "https://fr.ford.ca/support/recalls/"
 
-OUTPUT_FILE = "ford_recalls_output4.csv"
+OUTPUT_FILE = "fr_ford_recalls_output.csv"
+
+# One random row per VIN; HTTP proxy (CONNECT) for Chromium.
+# CSV columns: Host, Port, User, Pass (case-insensitive headers).
+PROXIES_FILE = "iproyal-proxies-10.csv"
 
 # Ford CA — contains(., ...) catches trailing * and mixed text nodes
 XPATH_H2_NO_RECALLS = '//h2[contains(., "No Recalls")]'
@@ -154,6 +161,90 @@ def read_vins_from_file():
     )
 
 
+def _row_to_playwright_proxy(row):
+    """
+    Build Playwright `proxy` dict from a CSV row (normalized keys).
+    Returns None if host/port missing.
+    """
+    norm = {
+        _normalize_header(k): (v if v is not None else "")
+        for k, v in row.items()
+        if k is not None
+    }
+    host = str(norm.get("HOST", "")).strip()
+    port = str(norm.get("PORT", "")).strip()
+    user = str(norm.get("USER", "")).strip()
+    password = str(norm.get("PASS", "")).strip()
+    if not host or not port:
+        return None
+    proxy = {"server": f"http://{host}:{port}"}
+    if user:
+        proxy["username"] = user
+    if password:
+        proxy["password"] = password
+    return proxy
+
+
+def load_proxies_from_file():
+    """
+    Load proxy endpoints from PROXIES_FILE (CSV).
+    Returns a list of Playwright-compatible proxy dicts; empty if
+    file missing or no valid rows.
+    """
+    path = Path(PROXIES_FILE)
+    if not path.exists():
+        print(
+            f"\nProxy file not found ({PROXIES_FILE}); "
+            "scraping without proxy."
+        )
+        return []
+
+    encodings_to_try = [
+        "utf-8-sig", "utf-8", "cp1252", "latin-1"
+    ]
+    last_decode_error = None
+    for encoding in encodings_to_try:
+        try:
+            with open(
+                PROXIES_FILE,
+                "r",
+                newline="",
+                encoding=encoding,
+            ) as csvfile:
+                reader = csv.DictReader(csvfile)
+                if not reader.fieldnames:
+                    print(
+                        f"\nProxy file has no header row ({PROXIES_FILE}); "
+                        "scraping without proxy."
+                    )
+                    return []
+                proxies = []
+                for row in reader:
+                    p = _row_to_playwright_proxy(row)
+                    if p:
+                        proxies.append(p)
+                if not proxies:
+                    print(
+                        f"\nNo valid proxy rows in {PROXIES_FILE}; "
+                        "scraping without proxy."
+                    )
+                    return []
+                print(
+                    f"Loaded {len(proxies)} proxy endpoint(s) from "
+                    f"{PROXIES_FILE}"
+                )
+                return proxies
+        except UnicodeDecodeError as decode_error:
+            last_decode_error = decode_error
+            continue
+    if last_decode_error:
+        print(
+            f"\nCould not decode {PROXIES_FILE}: {last_decode_error}; "
+            "scraping without proxy."
+        )
+    return []
+
+
 async def purge_cookies_and_cache(context, page):
     """
     Clear cookies and disk cache before closing the browser instance.
@@ -169,15 +260,42 @@ async def purge_cookies_and_cache(context, page):
         pass
 
 
+def _token_looks_like_model_year(token):
+    """True for a 4-digit calendar year typical on Ford VIN result pages."""
+    if not token or len(token) != 4 or not token.isdigit():
+        return False
+    year = int(token)
+    return 1980 <= year <= 2039
+
+
 def split_year_and_model(vehicle_line):
-    """First whitespace-separated token = year; remainder = model."""
+    """
+    Ford CA shows year + model in one string; order depends on locale.
+
+    English: first token is the year (e.g. ``2024 Escape``).
+    French: last token is the year; everything before is the model
+    (e.g. ``Escape 2024``, ``Bronco Sport 2021``).
+    """
     line = (vehicle_line or "").strip()
     if not line:
         return "", ""
-    parts = line.split(None, 1)
-    year = parts[0]
-    model = parts[1] if len(parts) > 1 else ""
-    return year, model
+    parts = line.split()
+    if len(parts) == 1:
+        only = parts[0]
+        if _token_looks_like_model_year(only):
+            return only, ""
+        return "", only
+
+    first, last = parts[0], parts[-1]
+    first_is_year = _token_looks_like_model_year(first)
+    last_is_year = _token_looks_like_model_year(last)
+
+    if first_is_year:
+        return first, " ".join(parts[1:])
+    if last_is_year:
+        return last, " ".join(parts[:-1])
+
+    return "", line
 
 
 async def expand_all_collapsed_accordions(page):
@@ -532,7 +650,7 @@ def save_to_csv(data):
         OUTPUT_FILE,
         "a",
         newline="",
-        encoding="utf-8"
+        encoding="utf-8-sig",
     ) as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         if not file_exists:
@@ -546,10 +664,12 @@ def save_to_csv(data):
 # MAIN
 # =========================
 
-async def process_one_vin_fresh_browser(playwright, vin):
+async def process_one_vin_fresh_browser(playwright, vin, proxy=None):
     """
     Dedicated browser lifecycle per VIN: launch → extract → purge
     cookies/cache → close (then next VIN starts a brand-new browser).
+
+    `proxy`: optional Playwright proxy dict (e.g. random pick per VIN).
 
     Returns `vin` if Playwright timed out (caller may retry in a new round).
     """
@@ -558,7 +678,15 @@ async def process_one_vin_fresh_browser(playwright, vin):
         slow_mo=50,
     )
 
-    context = await browser.new_context()
+    context_options = {}
+    if proxy:
+        context_options["proxy"] = proxy
+        print(
+            "Browser context proxy: "
+            f"{proxy.get('server', '')}"
+        )
+
+    context = await browser.new_context(**context_options)
     page = await context.new_page()
 
     timed_out = None
@@ -569,7 +697,7 @@ async def process_one_vin_fresh_browser(playwright, vin):
         await page.goto(URL, wait_until="domcontentloaded")
 
         vin_input = page.locator(
-            '//input[@aria-label="Input VIN."]'
+            '//input[@data-testid="input-text"]'
         )
         await vin_input.wait_for(
             state="visible",
@@ -663,6 +791,8 @@ async def main():
         print(f"\nERROR: {e}")
         return
 
+    proxies = load_proxies_from_file()
+
     pending = list(all_vins)
     round_num = 0
 
@@ -687,9 +817,16 @@ async def main():
                     f"{len(round_list)}) ---"
                 )
 
+                proxy = (
+                    random.choice(proxies)
+                    if proxies
+                    else None
+                )
+
                 retry_vin = await process_one_vin_fresh_browser(
                     p,
                     vin,
+                    proxy,
                 )
                 if retry_vin:
                     timeout_vins.append(retry_vin)
@@ -720,4 +857,15 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    _virtual_display = None
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        from pyvirtualdisplay import Display
+
+        _virtual_display = Display(visible=0, size=(1920, 1080))
+        _virtual_display.start()
+
+    try:
+        asyncio.run(main())
+    finally:
+        if _virtual_display is not None:
+            _virtual_display.stop()

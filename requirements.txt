@@ -1,0 +1,16 @@
+# pip install -r requirements.txt
+# Then install Chromium for Playwright: playwright install chromium
+# On Linux (e.g. Lightsail Ubuntu), browser libs:
+#   sudo playwright install-deps chromium
+#
+# headless=False needs a display on Linux. Install a virtual framebuffer:
+#   sudo apt update && sudo apt install -y xvfb
+# main.py starts Xvfb automatically when DISPLAY is unset (uses PyVirtualDisplay).
+# Or run without PyVirtualDisplay: xvfb-run -a python main.py
+#
+# Optional real desktop / remote viewing: xorg + tigervnc-scraping or a full
+# desktop AMI; set DISPLAY accordingly.
+
+playwright>=1.40.0
+openpyxl>=3.1.0
+PyVirtualDisplay>=3.0
