@@ -1,5 +1,7 @@
+import argparse
 import asyncio
 import csv
+import json
 import os
 import random
 import sys
@@ -19,39 +21,142 @@ TIMEOUT_MS = 10000
 # After each full batch, timed-out VINs run again in a fresh browser session.
 MAX_TIMEOUT_RETRY_SESSIONS = 2
 
-INPUT_FILE = "FORD-VIN-2020-2026.csv"
+INPUT_FILE = "ford_recalls_input.xlsx"
 
-URL = "https://fr.ford.ca/support/recalls/"
+RECALL_URLS = {
+    "en": "https://www.ford.ca/support/recalls/",
+    "fr": "https://fr.ford.ca/support/recalls/",
+}
 
-OUTPUT_FILE = "fr_ford_recalls_output.csv"
+# Set by configure_locale() from --lang (or FORD_RECALL_LANG).
+LANG = "en"
+# First non-empty Account value from the input file; used on every output row.
+RUN_ACCOUNT = ""
+URL = RECALL_URLS["en"]
+OUTPUT_FILE = "en_ford_recalls_output.csv"
+CHECKPOINT_FILE = "checkpoint_en_last_vin.txt"
+FAILED_VINS_FILE = "failed_vins_en.csv"
+STATUS_NO_RECALLS = "No Recalls"
+NEXT_STEPS_NO_CSP = "No CSP"
+XPATH_CSP_NEXT_STEPS_LABEL = "Next Steps"
 
 # Runtime throttling + crash-resume
 BATCH_SIZE = 50
 PER_VIN_DELAY_SECONDS_RANGE = (2, 5)
 BATCH_SLEEP_SECONDS_RANGE = (12 * 60, 15 * 60)
-CHECKPOINT_FILE = "checkpoint_last_vin.txt"
-FAILED_VINS_FILE = "failed_vins.csv"
 
 # One random row per VIN; HTTP proxy (CONNECT) for Chromium.
 # CSV columns: Host, Port, User, Pass (case-insensitive headers).
 PROXIES_FILE = "iproyal-proxies-10.csv"
 
 # Ford CA — contains(., ...) catches trailing * and mixed text nodes
-XPATH_H2_NO_RECALLS = '//h2[contains(., "No Recalls")]'
-XPATH_H2_NO_CSP = (
-    '//h2[contains(., "No Customer Satisfaction Programs")]'
-)
-XPATH_H2_RECALLS_OR_CSP = (
-    '//h2[contains(., "Recalls")] | '
-    '//h2[contains(., "Customer Satisfaction Programs")]'
-)
+XPATH_H2_NO_RECALLS = ""
+XPATH_H2_NO_CSP = ""
+XPATH_H2_RECALLS_OR_CSP = ""
 
 XPATH_VEHICLE_YM = '//div[@class="vehicle-information-ym"]'
+
+# Standard recall output schema (shared across OEM scrapers).
+MAKE_DEFAULT = "ford"
+STANDARD_OUTPUT_FIELDNAMES = [
+    "account",
+    "vin",
+    "year",
+    "make",
+    "model",
+    "type",
+    "campaign",
+    "status",
+    "source_url",
+    "language",
+    "title",
+    "description",
+    "other_fields",
+]
+
+LOCALE_CONFIG = {
+    "en": {
+        "url": RECALL_URLS["en"],
+        "output_file": "en_ford_recalls_std_output.csv",
+        "checkpoint_file": "checkpoint_en_last_vin.txt",
+        "failed_vins_file": "failed_vins_en.csv",
+        "h2_no_recalls": "No Recalls",
+        "h2_no_csp": "No Customer Satisfaction Programs",
+        "h2_recalls": "Recalls",
+        "h2_csp": "Customer Satisfaction Programs",
+        "csp_next_steps_label": "Next Steps",
+        "status_no_recalls": "No Recalls",
+        "next_steps_no_csp": "No CSP",
+    },
+    "fr": {
+        "url": RECALL_URLS["fr"],
+        "output_file": "fr_ford_recalls_std_output.csv",
+        "checkpoint_file": "checkpoint_fr_last_vin.txt",
+        "failed_vins_file": "failed_vins_fr.csv",
+        "h2_no_recalls": "Aucun rappel",
+        "h2_no_csp": "Aucun programme de satisfaction",
+        "h2_recalls": "Rappels",
+        "h2_csp": "satisfaction",
+        "csp_next_steps_label": "Prochaines étapes",
+        "status_no_recalls": "Aucun rappel",
+        "next_steps_no_csp": "Aucun PSC",
+    },
+}
 
 
 # =========================
 # HELPERS
 # =========================
+
+def _h2_contains_xpath(text):
+    return f'//h2[contains(., "{text}")]'
+
+
+def configure_locale(lang):
+    """Apply URL, output paths, and DOM strings for en or fr."""
+    global LANG, URL, OUTPUT_FILE, CHECKPOINT_FILE, FAILED_VINS_FILE
+    global XPATH_H2_NO_RECALLS, XPATH_H2_NO_CSP, XPATH_H2_RECALLS_OR_CSP
+    global STATUS_NO_RECALLS, NEXT_STEPS_NO_CSP, XPATH_CSP_NEXT_STEPS_LABEL
+
+    lang_key = (lang or "en").strip().lower()
+    if lang_key not in LOCALE_CONFIG:
+        raise ValueError(
+            f"Unsupported language '{lang}'. Use 'en' or 'fr'."
+        )
+
+    cfg = LOCALE_CONFIG[lang_key]
+    LANG = lang_key
+    URL = cfg["url"]
+    OUTPUT_FILE = cfg["output_file"]
+    CHECKPOINT_FILE = cfg["checkpoint_file"]
+    FAILED_VINS_FILE = cfg["failed_vins_file"]
+    STATUS_NO_RECALLS = cfg["status_no_recalls"]
+    NEXT_STEPS_NO_CSP = cfg["next_steps_no_csp"]
+    XPATH_CSP_NEXT_STEPS_LABEL = cfg["csp_next_steps_label"]
+
+    XPATH_H2_NO_RECALLS = _h2_contains_xpath(cfg["h2_no_recalls"])
+    XPATH_H2_NO_CSP = _h2_contains_xpath(cfg["h2_no_csp"])
+    XPATH_H2_RECALLS_OR_CSP = (
+        f'{_h2_contains_xpath(cfg["h2_recalls"])} | '
+        f'{_h2_contains_xpath(cfg["h2_csp"])}'
+    )
+
+
+def parse_cli_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Ford Canada VIN recall scraper (English or French site)."
+    )
+    parser.add_argument(
+        "--lang",
+        choices=["en", "fr"],
+        default=os.environ.get("FORD_RECALL_LANG", "en"),
+        help=(
+            "Site language: en -> www.ford.ca, fr -> fr.ford.ca "
+            "(default: en, or FORD_RECALL_LANG env var)."
+        ),
+    )
+    return parser.parse_args(argv)
+
 
 def _normalize_header(header):
     return (str(header or "")).strip().upper()
@@ -64,6 +169,119 @@ async def safe_text(locator):
     except Exception:
         pass
     return ""
+
+
+def _vin_column_key(fieldnames):
+    normalized = {_normalize_header(h): h for h in fieldnames}
+    vin_key = normalized.get("VIN")
+    if not vin_key:
+        raise ValueError(f"Column 'VIN' not found in {INPUT_FILE}")
+    return vin_key
+
+
+def _account_column_key(fieldnames):
+    normalized = {_normalize_header(h): h for h in fieldnames}
+    account_key = normalized.get("ACCOUNT")
+    if not account_key:
+        raise ValueError(f"Column 'Account' not found in {INPUT_FILE}")
+    return account_key
+
+
+def load_run_account_from_input():
+    """
+    Read the account name once from the input file (first non-empty
+    Account cell) and store it for all VINs in this run.
+    """
+    global RUN_ACCOUNT
+
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        raise ValueError(f"Input file not found: {INPUT_FILE}")
+
+    suffix = input_path.suffix.lower()
+    account = ""
+
+    if suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:
+            raise ValueError(
+                "Install openpyxl: pip install openpyxl"
+            ) from exc
+
+        workbook = load_workbook(
+            filename=INPUT_FILE,
+            read_only=True,
+            data_only=True,
+        )
+        sheet = workbook.active
+        header_row = next(
+            sheet.iter_rows(min_row=1, max_row=1, values_only=True),
+            None,
+        )
+        if not header_row:
+            raise ValueError(f"No header row in {INPUT_FILE}")
+
+        account_col_index = None
+        for index, header in enumerate(header_row):
+            if _normalize_header(header) == "ACCOUNT":
+                account_col_index = index
+                break
+        if account_col_index is None:
+            raise ValueError(f"Column 'Account' not found in {INPUT_FILE}")
+
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if account_col_index >= len(row):
+                continue
+            value = str(row[account_col_index] or "").strip()
+            if value:
+                account = value
+                break
+        workbook.close()
+
+    elif suffix == ".csv":
+        encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+        last_decode_error = None
+        for encoding in encodings_to_try:
+            try:
+                with open(
+                    INPUT_FILE, "r", newline="", encoding=encoding
+                ) as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    if not reader.fieldnames:
+                        raise ValueError(
+                            f"No header row in {INPUT_FILE}"
+                        )
+                    account_key = _account_column_key(
+                        reader.fieldnames
+                    )
+                    for row in reader:
+                        value = (row.get(account_key) or "").strip()
+                        if value:
+                            account = value
+                            break
+                break
+            except UnicodeDecodeError as decode_error:
+                last_decode_error = decode_error
+                continue
+        else:
+            if last_decode_error:
+                raise ValueError(
+                    f"Could not decode {INPUT_FILE}."
+                ) from last_decode_error
+            raise ValueError(f"Could not read {INPUT_FILE}")
+    else:
+        raise ValueError(
+            f"Unsupported extension '{suffix}'. Use .xlsx or .csv"
+        )
+
+    if not account:
+        raise ValueError(
+            f"No account name in column 'Account' in {INPUT_FILE}"
+        )
+
+    RUN_ACCOUNT = account
+    print(f"Account for this run: {RUN_ACCOUNT}")
 
 
 def read_vins_from_file():
@@ -132,15 +350,7 @@ def read_vins_from_file():
                         raise ValueError(
                             f"No header row in {INPUT_FILE}"
                         )
-                    normalized = {
-                        _normalize_header(h): h
-                        for h in reader.fieldnames
-                    }
-                    vin_key = normalized.get("VIN")
-                    if not vin_key:
-                        raise ValueError(
-                            f"Column 'VIN' not found in {INPUT_FILE}"
-                        )
+                    vin_key = _vin_column_key(reader.fieldnames)
                     vins = [
                         (row.get(vin_key) or "").strip()
                         for row in reader
@@ -246,14 +456,7 @@ def iter_vins_from_csv_streaming(resume_after_vin=""):
                 if not reader.fieldnames:
                     raise ValueError(f"No header row in {INPUT_FILE}")
 
-                normalized = {
-                    _normalize_header(h): h for h in reader.fieldnames
-                }
-                vin_key = normalized.get("VIN")
-                if not vin_key:
-                    raise ValueError(
-                        f"Column 'VIN' not found in {INPUT_FILE}"
-                    )
+                vin_key = _vin_column_key(reader.fieldnames)
 
                 skipping = bool(resume_after_vin)
                 resume_after_vin = (resume_after_vin or "").strip()
@@ -675,7 +878,7 @@ async def parse_csp(page):
 
         next_steps = await safe_text(
             item.locator(
-                'xpath=.//div[contains(.,"Next Steps")]'
+                f'xpath=.//div[contains(.,"{XPATH_CSP_NEXT_STEPS_LABEL}")]'
                 '/following-sibling::div'
             )
         )
@@ -695,73 +898,125 @@ async def parse_csp(page):
 # SAVE CSV
 # =========================
 
+def _format_campaign_for_excel(campaign):
+    """
+    Prefix campaign codes with ' so Excel keeps them as text (avoids 260 -> 2.60E+02).
+    """
+    value = (campaign or "").strip()
+    if not value:
+        return ""
+    if value.startswith("'"):
+        return value
+    return f"'{value}"
+
+
+def _format_other_fields(**extra):
+    """JSON object string for non-standard columns (empty if none)."""
+    payload = {
+        key: value
+        for key, value in extra.items()
+        if value not in (None, "")
+    }
+    if not payload:
+        return ""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _standard_row(
+    account,
+    vin,
+    year,
+    model,
+    row_type,
+    *,
+    campaign="",
+    status="",
+    title="",
+    description="",
+    other_fields="",
+):
+    return {
+        "account": account,
+        "vin": vin,
+        "year": year,
+        "make": MAKE_DEFAULT,
+        "model": model,
+        "type": row_type,
+        "campaign": _format_campaign_for_excel(campaign),
+        "status": status,
+        "source_url": URL,
+        "language": LANG,
+        "title": title,
+        "description": description,
+        "other_fields": other_fields,
+    }
+
+
 def save_to_csv(data):
     file_exists = Path(OUTPUT_FILE).exists()
     rows = []
+    account = RUN_ACCOUNT
+    vin = data["vin"]
+    year = data["year"]
+    model = data["model"]
 
     if data["recalls"]:
         for recall in data["recalls"]:
-            rows.append({
-                "VIN": data["vin"],
-                "Section": "Recall",
-                "Year": data["year"],
-                "Model": data["model"],
-                "Title": recall["title"],
-                "Description": recall["description"],
-                "Campaign": recall["campaign"],
-                "Status": recall["status"],
-                "Next Steps": ""
-            })
+            rows.append(
+                _standard_row(
+                    account,
+                    vin,
+                    year,
+                    model,
+                    "Recall",
+                    campaign=recall["campaign"],
+                    status=recall["status"],
+                    title=recall["title"],
+                    description=recall["description"],
+                )
+            )
     else:
-        rows.append({
-            "VIN": data["vin"],
-            "Section": "Recall",
-            "Year": data["year"],
-            "Model": data["model"],
-            "Title": "",
-            "Description": "",
-            "Campaign": "",
-            "Status": "No Recalls",
-            "Next Steps": ""
-        })
+        rows.append(
+            _standard_row(
+                account,
+                vin,
+                year,
+                model,
+                "Recall",
+                status=STATUS_NO_RECALLS,
+            )
+        )
 
     if data["customer_satisfaction_programs"]:
         for csp in data["customer_satisfaction_programs"]:
-            rows.append({
-                "VIN": data["vin"],
-                "Section": "Customer Satisfaction Program",
-                "Year": data["year"],
-                "Model": data["model"],
-                "Title": csp["title"],
-                "Description": csp["description"],
-                "Campaign": csp["campaign"],
-                "Status": "",
-                "Next Steps": csp["next_steps"]
-            })
+            rows.append(
+                _standard_row(
+                    account,
+                    vin,
+                    year,
+                    model,
+                    "Customer Satisfaction Program",
+                    campaign=csp["campaign"],
+                    title=csp["title"],
+                    description=csp["description"],
+                    other_fields=_format_other_fields(
+                        next_steps=csp["next_steps"]
+                    ),
+                )
+            )
     else:
-        rows.append({
-            "VIN": data["vin"],
-            "Section": "Customer Satisfaction Program",
-            "Year": data["year"],
-            "Model": data["model"],
-            "Title": "",
-            "Description": "",
-            "Campaign": "",
-            "Status": "",
-            "Next Steps": "No CSP"
-        })
-
-    fieldnames = [
-        "VIN",
-        "Section",
-        "Year",
-        "Model",
-        "Title",
-        "Description",
-        "Campaign",
-        "Status",
-        "Next Steps",
-    ]
+        rows.append(
+            _standard_row(
+                account,
+                vin,
+                year,
+                model,
+                "Customer Satisfaction Program",
+                other_fields=_format_other_fields(
+                    next_steps=NEXT_STEPS_NO_CSP
+                ),
+            )
+        )
 
     with open(
         OUTPUT_FILE,
@@ -769,7 +1024,9 @@ def save_to_csv(data):
         newline="",
         encoding="utf-8-sig",
     ) as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            csvfile, fieldnames=STANDARD_OUTPUT_FIELDNAMES
+        )
         if not file_exists:
             writer.writeheader()
         writer.writerows(rows)
@@ -905,6 +1162,10 @@ async def process_one_vin_fresh_browser(playwright, vin, proxy=None):
 
 
 async def main():
+    load_run_account_from_input()
+    print(
+        f"Language: {LANG} | URL: {URL} | Output: {OUTPUT_FILE}"
+    )
     proxies = load_proxies_from_file()
     last_vin = load_checkpoint_last_vin()
     if last_vin:
@@ -942,7 +1203,7 @@ async def main():
             status = "error"
             for attempt in range(1, MAX_TIMEOUT_RETRY_SESSIONS + 2):
                 print(
-                    f"\nVIN {vin} — attempt {attempt}/"
+                    f"\n[{RUN_ACCOUNT}] VIN {vin} — attempt {attempt}/"
                     f"{MAX_TIMEOUT_RETRY_SESSIONS + 1}"
                 )
                 status = await process_one_vin_fresh_browser(
@@ -974,6 +1235,8 @@ async def main():
 
 
 if __name__ == "__main__":
+    configure_locale(parse_cli_args().lang)
+
     _virtual_display = None
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         from pyvirtualdisplay import Display
