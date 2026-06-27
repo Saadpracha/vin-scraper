@@ -77,7 +77,7 @@ STANDARD_OUTPUT_FIELDNAMES = [
 LOCALE_CONFIG = {
     "en": {
         "url": RECALL_URLS["en"],
-        "output_file": "en_ford_recalls_std_output.csv",
+        "output_file": "en_VIN_Service_Ford_2016_2026_output.csv",
         "checkpoint_file": "checkpoint_en_last_vin.txt",
         "failed_vins_file": "failed_vins_en.csv",
         "h2_no_recalls": "No Recalls",
